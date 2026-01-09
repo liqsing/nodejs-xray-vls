@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // app.js - Xray内核 VLESS代理服务脚本
-// 专为 64MB Pterodactyl 容器优化
+// 专为 64MB Pterodactyl 容器优化，支持路径持久化与多源ISP识别
 
 const fs = require('fs');
 const path = require('path');
@@ -14,290 +14,212 @@ const yauzl = require('yauzl');
 // ======================================================================
 // 核心配置区
 // ======================================================================
-const DOMAIN = "cloudflare.182682.xyz";  // 你的域名（Cloudflare 代理开启橙色云朵）
-const UUID = "";  // UUID变量，留空自动生成或写入固定值
-const PORT = "";  // 建议留空将自动使用分配的端口
-const NAME = "Panel";  // 节点名称，将显示在客户端
+const DOMAIN = process.env.DOMAIN || "example.com";   // 你的域名（Cloudflare 代理开启橙色云朵）
+const UUID = process.env.UUID || "";                  // UUID变量，留空自动生成或写入固定值
+const WSPATH = process.env.WSPATH || "";              // 留空则基于UUID生成固定路径
+const PORT = process.env.PORT || "";                  // 留空将自动使用分配的端口
+const NAME = process.env.NAME || "Panel";             // 节点名称前缀
 // ======================================================================
 
 class XrayProxy {
-    constructor(domain, user_uuid, port, name) {
-        this.uuid = user_uuid || crypto.randomUUID();
-        this.path = "/" + crypto.randomBytes(4).toString('hex');
-        this.domain = domain;
-        this.port = port;
-        this.process = null;
-        this.xrayPath = path.join(__dirname, 'xray', 'xray');
-        this.name = name;
-        this.setupSignalHandlers();
-    }
+    constructor(domain, user_uuid, port, name) {
+        this.uuid = user_uuid || crypto.randomUUID();
+        
+        if (WSPATH) {
+            this.path = WSPATH.startsWith('/') ? WSPATH : '/' + WSPATH;
+        } else {
+            const hash = crypto.createHash('md5').update(this.uuid).digest('hex').slice(0, 8);
+            this.path = '/' + hash;
+        }
+        
+        this.domain = domain;
+        this.port = port;
+        this.process = null;
+        this.xrayPath = path.join(__dirname, 'xray', 'xray');
+        this.name = name;
+        this.setupSignalHandlers();
+    }
 
-    setupSignalHandlers() {
-        const cleanupAndExit = () => {
-            console.log("\nStopping service...");
-            this.cleanup();
-            process.exit(0);
-        };
-        process.on('SIGINT', cleanupAndExit);
-        process.on('SIGTERM', cleanupAndExit);
-    }
+    setupSignalHandlers() {
+        const cleanupAndExit = () => {
+            console.log("\n正在停止服务...");
+            this.cleanup();
+            process.exit(0);
+        };
+        process.on('SIGINT', cleanupAndExit);
+        process.on('SIGTERM', cleanupAndExit);
+    }
 
-    async detectPterodactyl() {
-        const isPterodactyl = process.env.SERVER_IP && process.env.SERVER_PORT;
-        const envInfo = {
-            SERVER_MEMORY: process.env.SERVER_MEMORY,
-            SERVER_IP: process.env.SERVER_IP,
-            SERVER_PORT: process.env.SERVER_PORT
-        };
-        if (isPterodactyl) {
-            console.log("✓ Pterodactyl environment detected.");
-            for (const key in envInfo) {
-                console.log(`✓ Detected ${key}: ${envInfo[key]}`);
-            }
-        } else {
-            console.log("❌ Pterodactyl environment not detected, exiting.");
-            process.exit(1);
-        }
-        return {
-            serverIp: envInfo.SERVER_IP,
-            directPort: parseInt(envInfo.SERVER_PORT)
-        };
-    }
+    static async detectEnvironment() {
+        const isPterodactyl = process.env.SERVER_IP && process.env.SERVER_PORT;
+        if (isPterodactyl) {
+            console.log(`✓ 检测到 Pterodactyl 环境 (端口: ${process.env.SERVER_PORT})`);
+            return {
+                serverIp: process.env.SERVER_IP,
+                directPort: parseInt(process.env.SERVER_PORT)
+            };
+        } else {
+            console.log("❌ Pterodactyl environment not detected.");
+            process.exit(1);
+        }
+    }
 
-    async getISP(retries = 3) {
-        for (let attempt = 1; attempt <= retries; attempt++) {
-            try {
-                const isp = await new Promise((resolve, reject) => {
-                    const req = https.get('https://speed.cloudflare.com/meta', (res) => {
-                        let data = '';
-                        res.on('data', chunk => data += chunk);
-                        res.on('end', () => {
-                            try {
-                                const info = JSON.parse(data);
-                                resolve(`${info.country}-${info.asOrganization}`.replace(/ /g, '_'));
-                            } catch (e) {
-                                reject(e);
-                            }
-                        });
-                    });
-                    req.on('error', reject);
-                    req.end();
-                });
-                console.log(`✓ ISP detected: ${isp}`);
-                return isp;
-            } catch (e) {
-                console.log(`第${attempt}次尝试获取ISP失败: ${e.message}`);
-                if (attempt === retries) {
-                    console.log("❌ ISP信息获取失败，使用'Unknown'");
-                    return 'Unknown';
-                }
-                await new Promise(r => setTimeout(r, 1000));
-            }
-        }
-    }
+    async getISP(retries = 3) {
+        const apiSources = [
+            {
+                url: 'https://api.ip.sb/geoip',
+                parse: (data) => {
+                    const info = JSON.parse(data);
+                    return `${info.country_code}-${info.organization}`.replace(/ /g, '_');
+                }
+            },
+            {
+                url: 'https://www.cloudflare.com/cdn-cgi/trace',
+                parse: (data) => {
+                    const kv = {};
+                    data.split('\n').forEach(line => {
+                        const [k, v] = line.split('=');
+                        if (k && v) kv[k.trim()] = v.trim();
+                    });
+                    return `${kv.loc || 'UN'}-${kv.as_organization || 'CF'}`.replace(/ /g, '_');
+                }
+            }
+        ];
 
-    getXrayDownloadUrl() {
-        const archMap = { 'x64': 'amd64', 'arm64': 'arm64' };
-        const arch = archMap[os.arch()] || 'amd64';
-        const filename = arch === 'amd64' ? "Xray-linux-64.zip" : "Xray-linux-arm64-v8a.zip";
-        return `https://github.com/XTLS/Xray-core/releases/latest/download/${filename}`;
-    }
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            const source = apiSources[(attempt - 1) % apiSources.length];
+            try {
+                console.log(`[ISP] 尝试从 ${new URL(source.url).hostname} 获取信息...`);
+                const isp = await new Promise((resolve, reject) => {
+                    const req = https.get(source.url, { 
+                        headers: { 'User-Agent': 'Mozilla/5.0' },
+                        timeout: 5000 
+                    }, (res) => {
+                        let data = '';
+                        res.on('data', chunk => data += chunk);
+                        res.on('end', () => resolve(source.parse(data)));
+                    });
+                    req.on('error', reject);
+                    req.on('timeout', () => { req.destroy(); reject(new Error('超时')); });
+                });
+                return isp;
+            } catch (e) {
+                console.log(`[ISP] 第 ${attempt} 次尝试失败: ${e.message}`);
+                if (attempt === retries) return 'Unknown';
+                await new Promise(r => setTimeout(r, 1000));
+            }
+        }
+    }
 
-    async downloadXray(retries = 3) {
-        const url = this.getXrayDownloadUrl();
-        for (let attempt = 1; attempt <= retries; attempt++) {
-            try {
-                console.log(`Downloading Xray (attempt ${attempt}) from: ${url}`);
-                return await this._downloadFile(url, 'xray.zip');
-            } catch (e) {
-                console.log(`第${attempt}次下载Xray失败: ${e.message}`);
-                if (attempt === retries) throw e;
-                await new Promise(r => setTimeout(r, 2000));
-            }
-        }
-    }
+    getXrayDownloadUrl() {
+        const arch = os.arch() === 'arm64' ? "arm64-v8a" : "64";
+        return `https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip`;
+    }
 
-    async _downloadFile(url, dest) {
-        return new Promise((resolve, reject) => {
-            const request = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (response) => {
-                if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                    console.log(`Redirecting to: ${response.headers.location}`);
-                    return this._downloadFile(response.headers.location, dest).then(resolve).catch(reject);
-                }
-                if (response.statusCode !== 200) {
-                    return reject(new Error(`Download failed: HTTP status ${response.statusCode}`));
-                }
-                const fileStream = fs.createWriteStream(dest);
-                response.pipe(fileStream);
-                fileStream.on('finish', () => {
-                    fileStream.close();
-                    console.log("Download complete.");
-                    resolve(true);
-                });
-                fileStream.on('error', reject);
-            }).on('error', reject);
-        });
-    }
+    async downloadAndExtract() {
+        const url = this.getXrayDownloadUrl();
+        const zipPath = 'xray.zip';
+        
+        try {
+            console.log(`正在下载 Xray...`);
+            await this._downloadFile(url, zipPath);
+            
+            return new Promise((resolve, reject) => {
+                yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+                    if (err) return reject(err);
+                    zipfile.on('entry', (entry) => {
+                        if (entry.fileName === 'xray') {
+                            zipfile.openReadStream(entry, (err, readStream) => {
+                                if (err) return reject(err);
+                                if (!fs.existsSync(path.dirname(this.xrayPath))) fs.mkdirSync(path.dirname(this.xrayPath));
+                                const writeStream = fs.createWriteStream(this.xrayPath);
+                                pipeline(readStream, writeStream).then(() => {
+                                    fs.chmodSync(this.xrayPath, 0o755);
+                                    fs.unlinkSync(zipPath);
+                                    resolve(true);
+                                }).catch(reject);
+                            });
+                        } else { zipfile.readEntry(); }
+                    });
+                    zipfile.readEntry();
+                });
+            });
+        } catch (e) {
+            console.error("下载/解压失败:", e.message);
+            return false;
+        }
+    }
 
-    async extractXray() {
-        const zipPath = 'xray.zip';
-        if (!fs.existsSync(zipPath)) {
-            console.log("✗ xray.zip does not exist, skipping extraction.");
-            return false;
-        }
-        console.log("Extracting Xray...");
-        return new Promise((resolve, reject) => {
-            yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
-                if (err) return reject(err);
-                let extracted = false;
-                zipfile.on('entry', (entry) => {
-                    const entryPath = entry.fileName;
-                    if (entryPath.includes('xray')) {
-                        zipfile.openReadStream(entry, (err, readStream) => {
-                            if (err) return reject(err);
-                            const writeStream = fs.createWriteStream(this.xrayPath);
-                            pipeline(readStream, writeStream)
-                                .then(() => {
-                                    fs.chmodSync(this.xrayPath, 0o755);
-                                    fs.unlinkSync(zipPath);
-                                    console.log("Extraction and cleanup complete.");
-                                    extracted = true;
-                                    resolve(true);
-                                })
-                                .catch(reject);
-                        });
-                    } else {
-                        zipfile.readEntry();
-                    }
-                });
-                zipfile.on('end', () => {
-                    if (!extracted) {
-                        console.error("❌ Error: Xray executable not found in zip file.");
-                        resolve(false);
-                    }
-                });
-                zipfile.readEntry();
-            });
-        });
-    }
+    async _downloadFile(url, dest) {
+        return new Promise((resolve, reject) => {
+            https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+                if (res.statusCode >= 300 && res.headers.location) return this._downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+                const file = fs.createWriteStream(dest);
+                res.pipe(file).on('finish', () => { file.close(); resolve(); });
+            }).on('error', reject);
+        });
+    }
 
-    generateConfig() {
-        const config = {
-            "log": { "loglevel": "error" },
-            "inbounds": [
-                {
-                    "port": this.port,
-                    "listen": "0.0.0.0",
-                    "protocol": "vless",
-                    "settings": {
-                        "clients": [{ "id": this.uuid, "level": 0 }],
-                        "decryption": "none"
-                    },
-                    "streamSettings": {
-                        "network": "ws",
-                        "security": "none",
-                        "wsSettings": {
-                            "path": this.path,
-                            "headers": { "Host": this.domain }
-                        }
-                    }
-                }
-            ],
-            "outbounds": [{ "protocol": "freedom", "settings": {} }],
-            "policy": { "levels": { "0": { "bufferSize": 256, "connIdle": 120 } } }
-        };
-        fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
-    }
+    generateConfig() {
+        const config = {
+            "log": { "loglevel": "error" },
+            "inbounds": [{
+                "port": this.port,
+                "listen": "0.0.0.0",
+                "protocol": "vless",
+                "settings": { "clients": [{ "id": this.uuid, "level": 0 }], "decryption": "none" },
+                "streamSettings": {
+                    "network": "ws",
+                    "security": "none",
+                    "wsSettings": { "path": this.path, "headers": { "Host": this.domain } }
+                }
+            }],
+            "outbounds": [{ "protocol": "freedom", "settings": {} }],
+            "policy": { "levels": { "0": { "bufferSize": 64, "connIdle": 120 } } } // 64MB内存优化：降低缓冲区
+        };
+        fs.writeFileSync('config.json', JSON.stringify(config, null, 2));
+    }
 
-    displayInfo(ispInfo) {
-        console.log("\n" + "=".repeat(60));
-        console.log("VLESS Xray CDN-only service is now running");
-        console.log("=".repeat(60));
-        
-        const nodeName = `${this.name}-${ispInfo}`;
-        const cdnLink = `vless://${this.uuid}@${this.domain}:443?encryption=none&security=tls&type=ws&host=${encodeURIComponent(this.domain)}&path=${encodeURIComponent(this.path)}&sni=${encodeURIComponent(this.domain)}#${encodeURIComponent(nodeName)}`;
+    displayInfo(ispInfo) {
+        const nodeName = `${this.name}-${ispInfo}`;
+        const cdnLink = `vless://${this.uuid}@${this.domain}:443?encryption=none&security=tls&type=ws&host=${encodeURIComponent(this.domain)}&path=${encodeURIComponent(this.path)}&sni=${encodeURIComponent(this.domain)}#${encodeURIComponent(nodeName)}`;
+        
+        const base64Link = Buffer.from(cdnLink).toString('base64');
+        
+        console.log("\n" + "=".repeat(50));
+        console.log(`✅ Service is running...`);
+        console.log("=".repeat(50));
+        console.log(`\n🔐 Base64 编码（订阅）:`);
+        console.log(base64Link);
+        fs.writeFileSync('vless_xray_links.txt', base64Link);
+    }
 
-        console.log(`\n🔗 **CDN 节点链接**:\n${cdnLink}`);
-        
-        fs.writeFileSync('vless_xray_links.txt', `CDN 节点：\n${cdnLink}`);
-        
-        console.log(`\n链接已保存到: vless_xray_links.txt`);
-        console.log("\n⚠ **重要提示**:");
-        console.log(`1. 节点仅支持 CDN 模式，请确保你的域名 (${this.domain}) 在 Cloudflare 已开启代理（橙色云朵）。`);
-        console.log(`2. 你需要通过 Cloudflare 的 **Origin Rules** 将流量路由到代理监听端口 (${this.port})。`);
-        console.log(`3. Cloudflare 的 SSL/TLS 加密模式必须为 **灵活 (Flexible)**。`);
-        console.log("\n✅ 服务运行中 (Ctrl+C to stop)");
-    }
+    startService() {
+        const env = { ...process.env, GOMEMLIMIT: '12MiB', GOGC: '10' };
+        this.process = spawn(this.xrayPath, ['run', '-config', 'config.json'], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+        this.process.stderr.on('data', (d) => console.error(`[Xray] ${d}`));
+    }
 
-    startService() {
-        // 调整 GOMEMLIMIT 以进一步限制内存使用
-        const env = { ...process.env, GOMEMLIMIT: '10MiB', GOGC: '15' };
-        this.process = spawn(this.xrayPath, ['run', '-config', 'config.json'], {
-            env,
-            stdio: ['ignore', 'ignore', 'pipe']
-        });
-
-        this.process.stderr.on('data', (data) => {
-            console.error(`Xray stderr: ${data}`);
-        });
-
-        this.process.on('close', (code) => {
-            if (code !== 0) {
-                console.log(`Xray process exited with code ${code}`);
-            }
-        });
-    }
-
-    cleanup() {
-        if (this.process) {
-            this.process.kill('SIGTERM');
-        }
-        const filesToClean = ['xray.zip', 'config.json', 'vless_xray_links.txt'];
-        for (const file of filesToClean) {
-            try {
-                if (fs.existsSync(file)) {
-                    if (fs.lstatSync(file).isDirectory()) {
-                        fs.rmSync(file, { recursive: true, force: true });
-                    } else {
-                        fs.unlinkSync(file);
-                    }
-                }
-            } catch (e) {
-                console.error(`Failed to clean up ${file}: ${e}`);
-            }
-        }
-        if (fs.existsSync(this.xrayPath)) {
-             try { fs.rmSync(path.dirname(this.xrayPath), { recursive: true, force: true }); } catch (e) { console.error(`Failed to clean up Xray folder: ${e}`); }
-        }
-    }
+    cleanup() {
+        if (this.process) this.process.kill('SIGTERM');
+        ['xray.zip', 'config.json', 'vless_xray_links.txt'].forEach(f => {
+            try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(e){}
+        });
+    }
 }
 
 async function main() {
-    try {
-        const env = await new XrayProxy().detectPterodactyl();
-        const containerPort = PORT === "" ? env.directPort : parseInt(PORT);
-        const proxy = new XrayProxy(DOMAIN, UUID, containerPort, NAME);
+    const env = await XrayProxy.detectEnvironment();
+    const finalPort = PORT === "" ? env.directPort : parseInt(PORT);
+    const proxy = new XrayProxy(DOMAIN, UUID, finalPort, NAME);
 
-        if (!fs.existsSync(path.join(__dirname, 'xray'))) {
-            fs.mkdirSync(path.join(__dirname, 'xray'));
-        }
-        
-        const ispInfo = await proxy.getISP();
+    const ispInfo = await proxy.getISP(3);
 
-        if (await proxy.downloadXray() && await proxy.extractXray()) {
-            proxy.generateConfig();
-            proxy.displayInfo(ispInfo);
-            proxy.startService();
-        } else {
-            console.log("❌ Failed to start the service.");
-            proxy.cleanup();
-            process.exit(1);
-        }
-    } catch (e) {
-        console.error("An error occurred:", e);
-        process.exit(1);
-    }
+    if (await proxy.downloadAndExtract()) {
+        proxy.generateConfig();
+        proxy.displayInfo(ispInfo);
+        proxy.startService();
+    }
 }
 
-main();
-
+main().catch(console.error);
