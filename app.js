@@ -189,7 +189,7 @@ class XrayProxy {
         console.log("\n" + "=".repeat(50));
         console.log(`✅ Service is running...`);
         console.log("=".repeat(50));
-        console.log(`\n🔐 Base64 编码（订阅）:`);
+        console.log(`\n🔐 Base64 订阅链接:`);
         console.log(base64Link);
         fs.writeFileSync('vless_xray_links.txt', base64Link);
     }
