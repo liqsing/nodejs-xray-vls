@@ -78,10 +78,10 @@ class XrayProxy {
                 parse: (data) => {
                     const kv = {};
                     data.split('\n').forEach(line => {
-                        const [k, v] = line.split('=');
-                        if (k && v) kv[k.trim()] = v.trim();
+                        const parts = line.split('=');
+                        if (parts.length >= 2) kv[parts[0].trim()] = parts[1].trim();
                     });
-                    return `${kv.loc || 'UN'}-${kv.as_organization || 'CF'}`.replace(/ /g, '_');
+                    return `${kv.loc || 'UN'}-${kv.colo || 'CF'}`.replace(/ /g, '_');
                 }
             }
         ];
@@ -189,7 +189,7 @@ class XrayProxy {
         console.log("\n" + "=".repeat(50));
         console.log(`✅ Service is running...`);
         console.log("=".repeat(50));
-        console.log(`\n🔐 Base64 订阅链接:`);
+        console.log(`\n🔐 Base64 编码（订阅）:`);
         console.log(base64Link);
         fs.writeFileSync('vless_xray_links.txt', base64Link);
     }
@@ -223,4 +223,3 @@ async function main() {
 }
 
 main().catch(console.error);
-
